@@ -19,6 +19,19 @@ local function remove(id)
     redis.call('ZREM', KEYS[4], id)
     redis.call('HDEL', KEYS[5], id)
 end
+if action == 'claim' then
+    local ids = redis.call('ZRANGE', KEYS[3], 0, 99)
+    for _, id in ipairs(ids) do
+        local raw = redis.call('HGET', KEYS[5], id)
+        local member = raw and cjson.decode(raw) or nil
+        remove(id)
+        if member and tonumber(member.deadline_us) > now then
+            return {'member', raw}
+        end
+    end
+    if #ids == 100 then return {'retry'} end
+    return {'absent'}
+end
 if action == 'cleanup' then
     local ids = redis.call('ZRANGEBYSCORE', KEYS[4], '-inf', now, 'LIMIT', 0, ARGV[3])
     for _, id in ipairs(ids) do remove(id) end

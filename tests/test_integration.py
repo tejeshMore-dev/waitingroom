@@ -41,6 +41,102 @@ def test_missing_and_config(room):
     assert not room.create_queue('q', 60.0)
     with pytest.raises(QueueConfigurationConflict):
         room.create_queue('q', 61)
+    with pytest.raises(QueueNotFound):
+        room.claim_next('missing')
+
+
+def process_claim(args):
+    url, prefix = args
+    client = Redis.from_url(url)
+    try:
+        member = WaitingRoom(client, prefix).claim_next('q')
+        return member.membership_token if member else None
+    finally:
+        client.close()
+
+
+def test_claim_fifo_data_removal_and_rejoin(room):
+    room.create_queue('q', 60)
+    assert room.claim_next('q') is None
+    a = room.join('q', 'a', {'name': 'Alice', 'number': 2**60})
+    room.join('q', 'b')
+    claimed = room.claim_next('q')
+    assert claimed == a
+    assert room.get_user('q', 'a') is None
+    assert room.get_position('q', 'b') == 1
+    assert room.heartbeat('q', 'a', a.membership_token) is None
+    for key in room._keys('q')[2:4]:
+        assert room.redis.zscore(key, 'a') is None
+    assert room.redis.hget(room._keys('q')[4], 'a') is None
+    rejoined = room.join('q', 'a')
+    assert rejoined.membership_token != a.membership_token
+    with pytest.raises(StaleMembershipToken):
+        room.heartbeat('q', 'a', a.membership_token)
+    assert room.claim_next('q').user_id == 'b'
+    assert room.claim_next('q').membership_token == rejoined.membership_token
+    assert room.claim_next('q') is None
+
+
+def test_claim_skips_expired_backlog(room):
+    room.create_queue('q', .3)
+    for i in range(205):
+        room.join('q', str(i))
+    time.sleep(.35)
+    active = room.join('q', 'active')
+    assert room.claim_next('q') == active
+    assert room.cleanup_expired('q') == 0
+    assert room.get_queue_size('q') == 0
+    for i in range(105):
+        room.join('q', str(i))
+    time.sleep(.35)
+    assert room.claim_next('q') is None
+    assert room.redis.hlen(room._keys('q')[4]) == 0
+
+
+def test_concurrent_claims(room):
+    room.create_queue('q', 60)
+    expected = {room.join('q', str(i)).membership_token for i in range(40)}
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: WaitingRoom(room.redis, room.key_prefix).claim_next('q'), range(60)))
+    tokens = [m.membership_token for m in results if m]
+    assert len(tokens) == len(set(tokens)) == 40
+    assert set(tokens) == expected
+    assert room.get_queue_size('q') == 0
+
+
+def test_multiprocess_claims(room):
+    room.create_queue('q', 60)
+    expected = {room.join('q', str(i)).membership_token for i in range(12)}
+    args = [(os.getenv('REDIS_URL', 'redis://localhost:6379/15'), room.key_prefix)] * 20
+    with ProcessPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(process_claim, args))
+    tokens = [token for token in results if token]
+    assert len(tokens) == len(set(tokens)) == 12
+    assert set(tokens) == expected
+
+
+def test_claim_races_with_other_mutations(room):
+    room.create_queue('q', 60)
+    for _ in range(10):
+        old = room.join('q', 'a')
+        def heartbeat():
+            try:
+                return room.heartbeat('q', 'a', old.membership_token)
+            except StaleMembershipToken:
+                return None
+        def rejoin():
+            room.leave('q', 'a')
+            return room.join('q', 'a')
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            claims = [pool.submit(room.claim_next, 'q'), pool.submit(heartbeat),
+                      pool.submit(rejoin), pool.submit(room.cleanup_expired, 'q')]
+            claimed, _, new, _ = [f.result() for f in claims]
+        remaining = room.get_user('q', 'a')
+        if claimed and claimed.membership_token == new.membership_token:
+            assert remaining is None
+        else:
+            assert remaining.membership_token == new.membership_token
+        room.leave('q', 'a')
 
 
 def test_fifo_duplicate_delete_and_attributes(room):

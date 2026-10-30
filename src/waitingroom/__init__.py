@@ -105,6 +105,8 @@ class WaitingRoom:
             return _member(result[1])
         if status == 'absent':
             return None
+        if status == 'retry':
+            return status
         return int(result[1])
 
     def join(self, queue: str, user_id: str, attributes: Any = None) -> Membership:
@@ -115,6 +117,18 @@ class WaitingRoom:
     def leave(self, queue: str, user_id: str) -> bool:
         self._user(user_id)
         return bool(self._run(queue, 'leave', user_id))
+
+    def claim_next(self, queue: str) -> Membership | None:
+        """Atomically return and remove the first active FIFO membership.
+
+        Expired heads are discarded in bounded batches. Returns None when empty.
+        This is a destructive dequeue, with no processing lease or acknowledgement.
+        A lost response may mean a membership was removed without being received.
+        """
+        while True:
+            result = self._run(queue, 'claim')
+            if result != 'retry':
+                return result
 
     def heartbeat(self, queue: str, user_id: str, membership_token: str) -> Membership | None:
         self._user(user_id)
